@@ -143,6 +143,7 @@ struct _FuEngine {
 	guint acquiesce_delay;
 	guint update_motd_id;
 	FuEngineInstallPhase install_phase;
+	FuEngineLoadFlags load_flags;
 #ifdef HAVE_PASSIM
 	PassimClient *passim_client;
 #endif
@@ -747,6 +748,29 @@ fu_engine_reset_config(FuEngine *self, const gchar *section, GError **error)
 	return fu_config_reset_defaults(FU_CONFIG(self->config), section, error);
 }
 
+static gboolean
+fu_engine_load_remotes(FuEngine *self, GError **error)
+{
+	FuRemoteListLoadFlags remote_list_flags = FU_REMOTE_LIST_LOAD_FLAG_FIX_METADATA_URI;
+
+	if (!(self->load_flags & FU_ENGINE_LOAD_FLAG_REMOTES))
+		return TRUE;
+
+	if (fu_engine_config_get_test_devices(self->config))
+		remote_list_flags |= FU_REMOTE_LIST_LOAD_FLAG_TEST_REMOTE;
+	if (self->load_flags & FU_ENGINE_LOAD_FLAG_READONLY)
+		remote_list_flags |= FU_REMOTE_LIST_LOAD_FLAG_READONLY_FS;
+	if (self->load_flags & FU_ENGINE_LOAD_FLAG_NO_CACHE)
+		remote_list_flags |= FU_REMOTE_LIST_LOAD_FLAG_NO_CACHE;
+	fu_remote_list_set_lvfs_metadata_format(self->remote_list, FU_LVFS_METADATA_FORMAT);
+	if (!fu_remote_list_load(self->remote_list, remote_list_flags, error)) {
+		g_prefix_error(error, "Failed to load remotes: ");
+		return FALSE;
+	}
+
+	return TRUE;
+}
+
 gboolean
 fu_engine_modify_config(FuEngine *self,
 			const gchar *section,
@@ -797,8 +821,19 @@ fu_engine_modify_config(FuEngine *self,
 			return FALSE;
 		}
 
-		/* modify, effective next reboot */
-		return fu_config_set_value(FU_CONFIG(self->config), section, key, value, error);
+		/* many options need a reboot after this */
+		if (!fu_config_set_value(FU_CONFIG(self->config), section, key, value, error))
+			return FALSE;
+
+		/* reload remotes */
+		if (g_strcmp0(key, "TestDevices") == 0) {
+			g_object_unref(self->remote_list);
+			self->remote_list = fu_remote_list_new();
+			if (!fu_engine_load_remotes(self, error))
+				return FALSE;
+		}
+
+		return TRUE;
 	}
 
 	/* handled per-plugin */
@@ -3975,7 +4010,7 @@ fu_engine_load_metadata_store_local(FuEngine *self,
 }
 
 static gboolean
-fu_engine_load_metadata_store(FuEngine *self, FuEngineLoadFlags flags, GError **error)
+fu_engine_load_metadata_store(FuEngine *self, GError **error)
 {
 	GPtrArray *remotes;
 	XbBuilderCompileFlags compile_flags = XB_BUILDER_COMPILE_FLAG_IGNORE_INVALID;
@@ -4074,11 +4109,11 @@ fu_engine_load_metadata_store(FuEngine *self, FuEngineLoadFlags flags, GError **
 		return FALSE;
 
 	/* on a read-only filesystem don't care about the cache GUID */
-	if (flags & FU_ENGINE_LOAD_FLAG_READONLY)
+	if (self->load_flags & FU_ENGINE_LOAD_FLAG_READONLY)
 		compile_flags |= XB_BUILDER_COMPILE_FLAG_IGNORE_GUID;
 
 	/* ensure silo is up to date */
-	if (flags & FU_ENGINE_LOAD_FLAG_NO_CACHE) {
+	if (self->load_flags & FU_ENGINE_LOAD_FLAG_NO_CACHE) {
 		g_autoptr(GFileIOStream) iostr = NULL;
 		xmlb = g_file_new_tmp(NULL, &iostr, error);
 		if (xmlb == NULL)
@@ -4136,7 +4171,7 @@ static void
 fu_engine_metadata_changed(FuEngine *self)
 {
 	g_autoptr(GError) error_local = NULL;
-	if (!fu_engine_load_metadata_store(self, FU_ENGINE_LOAD_FLAG_NONE, &error_local))
+	if (!fu_engine_load_metadata_store(self, &error_local))
 		g_warning("Failed to reload metadata store: %s", error_local->message);
 
 	/* set device properties from the metadata */
@@ -4432,7 +4467,7 @@ fu_engine_update_metadata_bytes(FuEngine *self,
 					   error))
 			return FALSE;
 	}
-	if (!fu_engine_load_metadata_store(self, FU_ENGINE_LOAD_FLAG_NONE, error))
+	if (!fu_engine_load_metadata_store(self, error))
 		return FALSE;
 
 	/* refresh SUPPORTED flag on devices */
@@ -7260,7 +7295,6 @@ fu_engine_load_plugins_builtins(FuEngine *self, FuProgress *progress)
 
 static gboolean
 fu_engine_load_plugins(FuEngine *self,
-		       FuEngineLoadFlags flags,
 		       FuProgress *progress,
 		       GError **error)
 {
@@ -7288,7 +7322,7 @@ fu_engine_load_plugins(FuEngine *self,
 	fu_progress_step_done(progress);
 
 	/* load builtins */
-	if (flags & FU_ENGINE_LOAD_FLAG_BUILTIN_PLUGINS)
+	if (self->load_flags & FU_ENGINE_LOAD_FLAG_BUILTIN_PLUGINS)
 		fu_engine_load_plugins_builtins(self, fu_progress_get_child(progress));
 	fu_progress_step_done(progress);
 
@@ -8120,6 +8154,8 @@ fu_engine_load(FuEngine *self, FuEngineLoadFlags flags, FuProgress *progress, GE
 	if (self->loaded)
 		return TRUE;
 
+	self->load_flags = flags;
+
 	/* progress */
 	fu_progress_set_id(progress, G_STRLOC);
 	fu_progress_add_flag(progress, FU_PROGRESS_FLAG_NO_PROFILE);
@@ -8182,20 +8218,8 @@ fu_engine_load(FuEngine *self, FuEngineLoadFlags flags, FuProgress *progress, GE
 	}
 
 	/* read remotes */
-	if (flags & FU_ENGINE_LOAD_FLAG_REMOTES) {
-		FuRemoteListLoadFlags remote_list_flags = FU_REMOTE_LIST_LOAD_FLAG_FIX_METADATA_URI;
-		if (fu_engine_config_get_test_devices(self->config))
-			remote_list_flags |= FU_REMOTE_LIST_LOAD_FLAG_TEST_REMOTE;
-		if (flags & FU_ENGINE_LOAD_FLAG_READONLY)
-			remote_list_flags |= FU_REMOTE_LIST_LOAD_FLAG_READONLY_FS;
-		if (flags & FU_ENGINE_LOAD_FLAG_NO_CACHE)
-			remote_list_flags |= FU_REMOTE_LIST_LOAD_FLAG_NO_CACHE;
-		fu_remote_list_set_lvfs_metadata_format(self->remote_list, FU_LVFS_METADATA_FORMAT);
-		if (!fu_remote_list_load(self->remote_list, remote_list_flags, error)) {
-			g_prefix_error(error, "Failed to load remotes: ");
-			return FALSE;
-		}
-	}
+	if (!fu_engine_load_remotes(self, error))
+		return FALSE;
 	fu_progress_step_done(progress);
 
 	/* create client certificate */
@@ -8232,7 +8256,7 @@ fu_engine_load(FuEngine *self, FuEngineLoadFlags flags, FuProgress *progress, GE
 	fu_progress_step_done(progress);
 
 	/* load plugins early, as we have to call ->load() *before* building quirk silo */
-	if (!fu_engine_load_plugins(self, flags, fu_progress_get_child(progress), error)) {
+	if (!fu_engine_load_plugins(self, fu_progress_get_child(progress), error)) {
 		g_prefix_error(error, "failed to load plugins: ");
 		return FALSE;
 	}
@@ -8278,7 +8302,7 @@ fu_engine_load(FuEngine *self, FuEngineLoadFlags flags, FuProgress *progress, GE
 	fu_progress_step_done(progress);
 
 	/* load AppStream metadata */
-	if (!fu_engine_load_metadata_store(self, flags, error)) {
+	if (!fu_engine_load_metadata_store(self, error)) {
 		g_prefix_error(error, "Failed to load AppStream data: ");
 		return FALSE;
 	}
